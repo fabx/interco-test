@@ -1,6 +1,9 @@
 
 https://www.nighthour.sg/articles/2018/google-cloud-platform-test-lab-strongswan-vpn.html
 
+####On the gcp
+
+```
 gcloud init
 gcloud config set compute/region europe-west1
 gcloud config set compute/zone europe-west1-b
@@ -45,11 +48,11 @@ labserver0  europe-west1-b  f1-micro                   172.16.1.2               
 labserver1  europe-west1-b  f1-micro                   172.16.1.3                  RUNNING
 mgmtserver  europe-west1-b  f1-micro                   172.16.0.3   35.195.65.30   RUNNING
 vpnserver   europe-west1-b  f1-micro                   172.16.0.2   35.241.182.25  RUNNING
+```
 
-#################################################################################################################################################################
+####on the remote vpn server
 
-on the remote vpn server
-
+```
 gcloud compute ssh vpnserver
 
 sudo su -
@@ -208,4 +211,163 @@ net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.send_redirects = 0
+```
 
+####on the local vpn server
+
+```
+sudo su -
+
+passwd
+# ab++++
+
+apt-get update
+apt-get dist-upgrade 
+
+apt install tzdata
+
+timedatectl set-timezone Europe/Paris
+
+vim /etc/login.defs 
+# change to
+# UMASK 077
+
+apt-get install strongswan iptables-persistent 
+
+vim /etc/security/limits.conf 
+# 1024 to 65536
+* soft nofile 65536
+* hard nofile 65536 
+
+groupadd --gid 8000 strongswan
+usermod -g strongswan strongswan 
+```
+
+####on the remote vpn server
+
+```
+sudo su -
+cd vpn-ca
+tar -czvf localcerts.tgz keys/local-vpn-gw.crt keys/local-vpn-gw.key keys/ca.crt
+
+mv localcerts.tgz /home/fabien_gatelier/
+chown fabien_gatelier /home/fabien_gatelier/localcerts.tgz
+```
+
+####on the cloud shell
+
+```
+gcloud compute scp fabien_gatelier@vpnserver:/home/fabien_gatelier/localcerts.tgz .
+scp -i .ssh/id_rsa_scaleway localcerts.tgz root@51.158.101.103:/root
+```
+
+####on the local vpn server
+
+```
+tar -zxvf localcerts.tgz
+mv keys/local-vpn-gw.crt /etc/ipsec.d/certs/
+mv keys/local-vpn-gw.key /etc/ipsec.d/private/
+mv keys/ca.crt /etc/ipsec.d/cacerts/
+rm localcerts.tgz
+rmdir keys 
+
+chown strongswan /etc/ipsec.d/private/local-vpn-gw.key
+chgrp strongswan /etc/ipsec.d/private
+chmod 750 /etc/ipsec.d/private
+chown strongswan /etc/ipsec.d/private/local-vpn-gw.key
+chmod 400 /etc/ipsec.d/private/local-vpn-gw.key
+chmod 644 /etc/ipsec.d/certs/local-vpn-gw.crt
+chmod 644 /etc/ipsec.d/cacerts/ca.crt 
+
+vim /etc/ipsec.secrets
+# : RSA local-vpn-gw.key 
+
+chown strongswan /etc/ipsec.secrets
+chmod 400 /etc/ipsec.secrets 
+
+vim /etc/strongswan.d/charon.conf
+user = strongswan 
+
+vim /etc/ipsec.conf
+
+config setup
+       strictcrlpolicy=no
+       uniqueids = yes
+       charondebug="ike 2, esp 2,  cfg 2, knl 2"
+
+conn gcp 
+       auto=add
+       compress=no
+       keyexchange=ikev2
+       aggressive = no
+       type = tunnel
+       fragmentation = yes
+       forceencaps = yes
+       ike = aes256gcm16-prfsha384-ecp384!
+       esp = aes256gcm16-prfsha384-ecp384!
+       lifetime = 1h
+       dpdaction = clear
+       dpddelay = 300s
+       # eap_identity=%any
+       
+       left=10.66.14.145
+       leftid = "C=FR, ST=IleDeFrance, L=Paris, O=netyou, OU=netyou, CN=local-vpn-gw, N=local-vpn-gw, E=fabien.gatelier@netyou.fr" 
+       leftcert = /etc/ipsec.d/certs/local-vpn-gw.crt
+       leftsendcert = always
+       leftsourceip=51.158.101.103
+
+       rightid = "C=FR, ST=IleDeFrance, L=Paris, O=netyou, OU=netyou, CN=remote-vpn-gw, N=remote-vpn-gw, E=fabien.gatelier@netyou.fr"
+       right=35.241.182.25
+       rightsubnet=172.16.0.0/24,172.16.1.0/24
+
+
+ #Configure Network address translation to masquerade local IPs to the 51.158.101.103 virtual ip. 
+ iptables -t nat -A POSTROUTING -s 10.66.14.145 -j ACCEPT
+ iptables -t nat -A POSTROUTING -m limit --limit 60/m --limit-burst 120 -j LOG --log-prefix "firewall: nat: "
+ iptables -t nat -A POSTROUTING -s 10.66.14.145/31 -d 172.16.0.0/16 -j SNAT --to 51.158.101.103
+
+ #Set MSS size to prevent fragmentation issues
+ iptables -t mangle -A FORWARD -m policy --pol ipsec --dir in -p tcp -m tcp --tcp-flags SYN,RST SYN -m tcpmss --mss 1361:1536 -j TCPMSS --set-mss 1360
+ iptables -t mangle -A FORWARD -m policy --pol ipsec --dir out -p tcp -m tcp --tcp-flags SYN,RST SYN -m tcpmss --mss 1361:1536 -j TCPMSS --set-mss 1360
+
+ #Set the local vpn server to only allow icmp and connections that are established. 
+ iptables -F INPUT
+ iptables -A INPUT -i lo -j ACCEPT
+ iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ iptables -A INPUT -p icmp --icmp-type 8 -m limit --limit 10/m  -j ACCEPT
+ iptables -A INPUT -p icmp --icmp-type 11 -m limit --limit 10/m  -j ACCEPT
+ iptables -A INPUT -p icmp --icmp-type 3 -m limit --limit 10/m  -j ACCEPT
+ iptables -A INPUT -m limit --limit 10/m --limit-burst 15 -j LOG --log-prefix "firewall: "
+ iptables -A INPUT -j DROP
+
+ #Forward traffic only for local subnet to remote 172.16.0.0/16
+ iptables -F FORWARD
+ iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ iptables -A FORWARD -s 10.66.14.145/31 -d 172.16.0.0/16 -j ACCEPT
+ iptables -A FORWARD -m limit --limit 10/m --limit-burst 15 -j LOG --log-prefix "firewall: forward: "
+ iptables -A FORWARD -j DROP
+
+ #Log outgoing connections
+ iptables -F OUTPUT
+ iptables -A OUTPUT -m limit --limit 10/m --limit-burst 15 -j LOG --log-prefix "firewall: output: "
+
+netfilter-persistent save 
+
+vim /etc/sysctl.conf
+
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.send_redirects = 0
+
+reboot
+
+ping 172.16.0.2 (OK) 
+ping 172.16.0.3 (OK)
+
+```
